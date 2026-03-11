@@ -1,0 +1,177 @@
+name: 部署MC开机中转到SAP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install CF CLI
+      run: |
+        wget -q -O - https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key | sudo apt-key add -
+        echo "deb https://packages.cloudfoundry.org/debian stable main" | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list
+        sudo apt-get update
+        sudo apt-get install -y cf8-cli
+
+    - name: 创建中转服务启动脚本
+      run: |
+        mkdir -p mcbot
+        cat > mcbot/app.py << 'PYEOF'
+        import os, urllib.parse, threading
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import urllib.request, json, ssl
+
+        PANEL_URL  = os.environ.get('PANEL_URL', '').rstrip('/')
+        USERNAME   = os.environ.get('PANEL_USERNAME', '')
+        PASSWORD   = os.environ.get('PANEL_PASSWORD', '')
+        SERVER_ID  = os.environ.get('SERVER_ID', '')
+        BOT_TOKEN  = os.environ.get('BOT_TOKEN', 'changeme')
+
+        ctx = ssl.create_default_context()
+
+        def do_request(method, url, data=None, headers={}):
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode()
+            except Exception as e:
+                return 0, str(e)
+
+        def login_and_start():
+            # Step1: 获取CSRF
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml',
+            }
+            status, body = do_request('GET', PANEL_URL + '/auth/login', headers=headers)
+            print(f'[Login page] {status}')
+
+            # 尝试获取XSRF cookie（暂存用）
+            xsrf = ''
+
+            # Step2: 登录
+            login_headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Origin': PANEL_URL,
+                'Referer': PANEL_URL + '/auth/login',
+            }
+            login_data = json.dumps({'user': USERNAME, 'password': PASSWORD}).encode()
+            status, body = do_request('POST', PANEL_URL + '/auth/login', data=login_data, headers=login_headers)
+            print(f'[Login] {status} {body[:200]}')
+
+            if status not in (200, 302, 204):
+                return False, f'登录失败 {status}'
+
+            # Step3: 发送开机
+            power_headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Origin': PANEL_URL,
+                'Referer': PANEL_URL + '/',
+            }
+            power_data = json.dumps({'signal': 'start'}).encode()
+            status, body = do_request(
+                'POST',
+                f'{PANEL_URL}/api/client/servers/{SERVER_ID}/power',
+                data=power_data,
+                headers=power_headers
+            )
+            print(f'[Power] {status} {body[:200]}')
+            if status == 204:
+                return True, '开机成功'
+            return False, f'开机失败 {status} {body[:100]}'
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # 静默日志
+
+            def do_GET(self):
+                if self.path == '/':
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'MC Bot OK')
+                    return
+                if self.path == f'/start?token={BOT_TOKEN}':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    ok, msg = login_and_start()
+                    result = json.dumps({'ok': ok, 'msg': msg})
+                    self.wfile.write(result.encode())
+                    return
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b'Forbidden')
+
+        port = int(os.environ.get('PORT', 8080))
+        print(f'MC Bot starting on port {port}')
+        print(f'Panel: {PANEL_URL}')
+        print(f'Server: {SERVER_ID}')
+        HTTPServer(('0.0.0.0', port), Handler).serve_forever()
+        PYEOF
+
+        # 创建 manifest.yml 让SAP知道怎么启动
+        cat > mcbot/manifest.yml << 'EOF'
+        applications:
+        - name: placeholder
+          memory: 256M
+          disk_quota: 512M
+          buildpacks:
+          - python_buildpack
+          command: python app.py
+          health-check-type: port
+        EOF
+
+        # 创建 requirements.txt（空，只用标准库）
+        touch mcbot/requirements.txt
+
+        # 创建 runtime.txt 指定Python版本
+        echo "python-3.11.x" > mcbot/runtime.txt
+
+        ls -la mcbot/
+
+    - name: Login to SAP CF
+      run: |
+        cf login -a https://api.cf.ap21.hana.ondemand.com \
+          -u "${{ secrets.EMAIL }}" \
+          -p "${{ secrets.PASSWORD }}"
+        ORG=$(cf orgs | sed -n '4p')
+        SPACE=$(cf spaces | sed -n '4p')
+        cf login -a https://api.cf.ap21.hana.ondemand.com \
+          -u "${{ secrets.EMAIL }}" \
+          -p "${{ secrets.PASSWORD }}" \
+          -o "$ORG" -s "$SPACE"
+        echo "ORG=$ORG" >> $GITHUB_ENV
+        echo "SPACE=$SPACE" >> $GITHUB_ENV
+
+    - name: 部署中转服务
+      run: |
+        cd mcbot
+        # 修改manifest里的应用名
+        sed -i 's/name: placeholder/name: mc-bot/' manifest.yml
+        cf push mc-bot -f manifest.yml
+
+    - name: 设置环境变量
+      run: |
+        cf set-env mc-bot PANEL_URL "${{ secrets.PTERODACTYL_URL }}"
+        cf set-env mc-bot PANEL_USERNAME "${{ secrets.PTERODACTYL_USERNAME }}"
+        cf set-env mc-bot PANEL_PASSWORD "${{ secrets.PTERODACTYL_PASSWORD }}"
+        cf set-env mc-bot SERVER_ID "${{ secrets.PTERODACTYL_SERVER_ID }}"
+        cf set-env mc-bot BOT_TOKEN "${{ secrets.BOT_TOKEN }}"
+        cf restart mc-bot
+
+    - name: 获取服务地址
+      run: |
+        ROUTE=$(cf app mc-bot | grep "routes:" | awk '{print $2}')
+        echo "✅ 中转服务部署成功！"
+        echo "服务地址: https://$ROUTE"
+        echo "开机接口: https://$ROUTE/start?token=你的BOT_TOKEN"
